@@ -7,6 +7,15 @@ M.opts = {
     pass_context_as_prompt = true,
     replace_selection = true,
     show_errors = true,
+    prompt_blend = 22,
+    prompt_border = "none",
+    prompt_min_width = 54,
+    prompt_max_width = 86,
+    prompt_row_offset = 3,
+    output_split = "noautocmd rightbelow vsplit",
+    output_ratio = 0.52,
+    output_min_width = 64,
+    output_max_width = 130,
 }
 
 M.mode = "work"
@@ -19,6 +28,19 @@ local spinner_frames = { "-", "\\", "|", "/" }
 
 local function log(msg, level)
     vim.notify(msg, level or vim.log.levels.INFO, { title = "novim" })
+end
+
+local function clamp(value, min_value, max_value)
+    if max_value < min_value then
+        max_value = min_value
+    end
+    if value < min_value then
+        return min_value
+    end
+    if value > max_value then
+        return max_value
+    end
+    return value
 end
 
 local function sanitize_lines(text)
@@ -303,8 +325,8 @@ end
 
 local function prompt_title()
     return string.format(
-        "Novim (%s)  %s",
-        M.mode,
+        "Novim • %s %s",
+        M.mode:upper(),
         M._spinner.icon
     )
 end
@@ -415,12 +437,12 @@ local function send_codex_request(user_prompt, selected, range, request_mode, ke
             end
 
             if request_mode == "ask" then
-                open_output(response, M._prompt.win)
+                open_output(response, M._prompt.win, request_mode)
                 return
             end
             if not range then
                 close_prompt()
-                open_output(response, M._prompt.win)
+                open_output(response, M._prompt.win, request_mode)
                 return
             end
 
@@ -438,7 +460,9 @@ local function open_inline_prompt(selected, range)
 
     local anchor_win = vim.api.nvim_get_current_win()
     local ui = vim.api.nvim_list_uis()[1]
-    local width = math.max(48, math.min(ui.width - 4, 72))
+    local prompt_max = math.max(20, math.min(ui.width - 4, M.opts.prompt_max_width))
+    local prompt_min = math.min(M.opts.prompt_min_width, prompt_max)
+    local width = clamp(math.floor(ui.width * 0.55), prompt_min, prompt_max)
     local win = nil
     local buf = vim.api.nvim_create_buf(false, true)
     M._prompt = {
@@ -475,10 +499,6 @@ local function open_inline_prompt(selected, range)
         end
 
         local request_mode = M.mode
-        if request_mode == "work" and not range then
-            request_mode = "ask"
-            log("No selection found; switching to ask mode for this request", vim.log.levels.INFO)
-        end
         local keep_prompt = request_mode == "ask"
         if not keep_prompt then
             close_prompt()
@@ -501,8 +521,8 @@ local function open_inline_prompt(selected, range)
     win = vim.api.nvim_open_win(buf, true, {
         relative = "editor",
         style = "minimal",
-        border = "rounded",
-        row = math.max(1, ui.height - 4),
+        border = M.opts.prompt_border,
+        row = math.max(1, ui.height - M.opts.prompt_row_offset),
         col = math.max(0, math.floor((ui.width - width) / 2)),
         width = width,
         height = 2,
@@ -511,6 +531,8 @@ local function open_inline_prompt(selected, range)
     })
     M._prompt.win = win
 
+    vim.api.nvim_win_set_option(win, "winblend", M.opts.prompt_blend)
+    vim.api.nvim_win_set_option(win, "winhighlight", "Normal:NormalFloat,FloatBorder:NormalFloat")
     vim.api.nvim_win_set_option(win, "wrap", false)
     vim.api.nvim_win_set_option(win, "cursorline", false)
     vim.api.nvim_win_set_option(win, "number", false)
@@ -530,11 +552,35 @@ local function open_inline_prompt(selected, range)
         M.toggle_mode()
         refresh_prompt_title()
     end, { buffer = buf, noremap = true, nowait = true, silent = true })
+    vim.keymap.set("i", "<A-m>", function()
+        M.toggle_mode()
+        refresh_prompt_title()
+    end, { buffer = buf, noremap = true, nowait = true, silent = true })
+    vim.keymap.set("n", "<A-m>", function()
+        M.toggle_mode()
+        refresh_prompt_title()
+    end, { buffer = buf, noremap = true, nowait = true, silent = true })
+    vim.keymap.set("n", "<leader>nm", function()
+        M.toggle_mode()
+        refresh_prompt_title()
+    end, { buffer = buf, noremap = true, nowait = true, silent = true })
+    vim.keymap.set("i", "<leader>nm", function()
+        M.toggle_mode()
+        refresh_prompt_title()
+    end, { buffer = buf, noremap = true, nowait = true, silent = true })
     vim.keymap.set("i", "<F3>", function()
         M.toggle_output_panel()
         return
     end, { buffer = buf, noremap = true, nowait = true, silent = true })
     vim.keymap.set("n", "<F3>", function()
+        M.toggle_output_panel()
+        return
+    end, { buffer = buf, noremap = true, nowait = true, silent = true })
+    vim.keymap.set("i", "<A-o>", function()
+        M.toggle_output_panel()
+        return
+    end, { buffer = buf, noremap = true, nowait = true, silent = true })
+    vim.keymap.set("n", "<A-o>", function()
         M.toggle_output_panel()
         return
     end, { buffer = buf, noremap = true, nowait = true, silent = true })
@@ -599,16 +645,37 @@ local function apply_response(response)
     vim.api.nvim_buf_set_text(M._last.bufnr, start_row, start_col, end_row, actual_end_col, response_lines)
 end
 
-open_output = function(response, anchor_win)
+local function decorate_output_lines(response, request_mode)
+    local mode = normalize_mode(request_mode or M.mode):upper()
+    local body = sanitize_lines(response)
+    if #body == 0 then
+        return {
+            "Novim " .. mode .. " answer",
+            string.rep("-", 30),
+            "No output.",
+            "",
+        }
+    end
+
+    local output_lines = {
+        "Novim " .. mode .. " answer",
+        string.rep("-", 30),
+        "",
+    }
+    vim.list_extend(output_lines, body)
+    return output_lines
+end
+
+open_output = function(response, anchor_win, request_mode)
     close_panel()
 
     local lines = sanitize_lines(response)
     M._panel.last_lines = lines
-    if #lines == 0 then
-        lines = { "No output." }
+    local output_lines = sanitize_lines(response)
+    if #output_lines == 0 then
+        output_lines = { "No output." }
     end
-
-    local output_lines = vim.deepcopy(lines)
+    output_lines = decorate_output_lines(response, request_mode)
     if #output_lines == 0 then
         output_lines = { "Novim answer (empty)", "No output." }
     end
@@ -625,9 +692,13 @@ open_output = function(response, anchor_win)
         pcall(vim.api.nvim_set_current_win, split_anchor)
     end
 
-    vim.cmd("noautocmd rightbelow vsplit")
+    vim.cmd(M.opts.output_split)
     local win = vim.api.nvim_get_current_win()
     local buf = vim.api.nvim_create_buf(false, false)
+    local output_max = math.max(20, math.min(vim.o.columns - 1, M.opts.output_max_width))
+    local output_min = math.min(M.opts.output_min_width, output_max)
+    local requested_width = math.floor(vim.o.columns * M.opts.output_ratio)
+    requested_width = clamp(requested_width, output_min, output_max)
     M._panel = {
         win = win,
         buf = buf,
@@ -657,8 +728,9 @@ open_output = function(response, anchor_win)
     vim.bo[buf].modifiable = false
     vim.bo[buf].readonly = true
     vim.api.nvim_win_set_buf(win, buf)
-    vim.api.nvim_win_set_width(win, math.max(64, math.min(math.floor(vim.o.columns * 0.5), 100)))
+    vim.api.nvim_win_set_width(win, requested_width)
     vim.api.nvim_win_set_option(win, "wrap", true)
+    vim.api.nvim_win_set_option(win, "winblend", 10)
     vim.api.nvim_win_set_option(win, "linebreak", true)
     vim.api.nvim_win_set_option(win, "breakindent", true)
     vim.api.nvim_win_set_option(win, "showbreak", "↳ ")
@@ -679,6 +751,9 @@ open_output = function(response, anchor_win)
         close_panel()
     end, { buffer = buf, noremap = true, nowait = true, silent = true })
     vim.keymap.set("n", "<F3>", function()
+        close_panel()
+    end, { buffer = buf, noremap = true, nowait = true, silent = true })
+    vim.keymap.set("n", "<A-o>", function()
         close_panel()
     end, { buffer = buf, noremap = true, nowait = true, silent = true })
 
@@ -702,7 +777,7 @@ function M.toggle_output_panel()
         log("No Novim output to toggle", vim.log.levels.WARN)
         return
     end
-    open_output(table.concat(M._panel.last_lines, "\n"), nil)
+    open_output(table.concat(M._panel.last_lines, "\n"), nil, M.mode)
 end
 
 function M.toggle_inline_prompt()

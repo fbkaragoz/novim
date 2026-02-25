@@ -3,23 +3,17 @@ if vim.g.loaded_novim then
 end
 vim.g.loaded_novim = 1
 
-vim.keymap.set({ "n", "x" }, "<leader>nm", function()
+vim.keymap.set({ "n", "x", "i" }, "<leader>nm", function()
+    require("novim").toggle_mode()
+end, { desc = "Novim: toggle ask/work mode" })
+vim.keymap.set({ "n", "x", "i" }, "<A-m>", function()
     require("novim").toggle_mode()
 end, { desc = "Novim: toggle ask/work mode" })
 
-vim.keymap.set("x", "<leader>na", function()
+vim.keymap.set({ "n", "x" }, "<leader>na", function()
     require("novim").set_mode("ask")
 end, { desc = "Novim: set ask mode" })
-
-vim.keymap.set("n", "<leader>na", function()
-    require("novim").set_mode("ask")
-end, { desc = "Novim: set ask mode" })
-
-vim.keymap.set("x", "<leader>nw", function()
-    require("novim").set_mode("work")
-end, { desc = "Novim: set work mode" })
-
-vim.keymap.set("n", "<leader>nw", function()
+vim.keymap.set({ "n", "x" }, "<leader>nw", function()
     require("novim").set_mode("work")
 end, { desc = "Novim: set work mode" })
 
@@ -32,6 +26,9 @@ vim.keymap.set({ "n", "x", "i" }, "<A-x>", function()
 end, { desc = "Novim: toggle inline prompt" })
 
 vim.keymap.set({ "n", "i" }, "<leader>no", function()
+    require("novim").toggle_output_panel()
+end, { desc = "Novim: toggle answer output panel" })
+vim.keymap.set({ "n", "i" }, "<A-o>", function()
     require("novim").toggle_output_panel()
 end, { desc = "Novim: toggle answer output panel" })
 
