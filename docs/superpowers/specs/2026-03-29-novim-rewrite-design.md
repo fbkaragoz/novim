@@ -58,101 +58,143 @@ plugin/
 **core/intent.lua**
 - Takes a user message string, returns an intent classification
 - Intent types: `explain`, `diagnose`, `fix`, `refactor`, `write`
-- Used by the conversation module to set expectations for the AI response format
+- The classified intent is included in the system prompt as a hint to the AI: `explain` → "respond with an explanation, no code changes", `fix`/`refactor`/`write` → "include a code block with the proposed change". This is a soft hint — the AI may override it (e.g., user says "fix this" but nothing is broken → AI responds with explanation only). The response `type` field reflects what the AI actually did, not what the intent predicted.
 - Simple keyword/pattern matching, not AI-powered — runs instantly
 
 **core/diff.lua**
 - Parses structured AI responses into a normalized format
-- Extracts code blocks, maps them to file locations
-- Produces a list of hunks: `{ file, start_line, removed_lines, added_lines }`
-- Handles edge cases: multi-file changes, no changes, malformed responses
+- Extracts fenced code blocks from the AI response. The AI is instructed (via system prompt) to include `@@ file:line @@` markers before code blocks to indicate where changes apply. Example:
+
+```
+@@ src/orders.lua:42 @@
+```lua
+function processOrder(_opts, callback)
+```
+
+- If markers are missing, falls back to fuzzy matching: takes the code block content and searches the current file buffer for the closest matching region using a line-by-line similarity score. This handles cases where the AI doesn't follow the format exactly.
+- Produces a list of hunks:
+```lua
+{
+  file = "src/orders.lua",       -- file path
+  start_line = 42,               -- 1-indexed line in buffer
+  old_lines = { "opts" },        -- actual line content being replaced
+  new_lines = { "_opts" },       -- actual line content to insert
+}
+```
+- `old_lines` and `new_lines` are arrays of strings (line content), not counts
+- Before applying, validates that `old_lines` still matches the buffer content at `start_line`. If the buffer has been edited since context was captured, the diff is rejected with a message: "Code has changed since this suggestion was made. Ask again for an updated fix."
+- Handles edge cases: no code blocks in response (type=explain), malformed markers, empty blocks
+
+## AI Communication Protocol
+
+### Single-turn with tool-use loop
+
+The AI port uses a request-response loop. Each call to `send()` may result in multiple round-trips if the AI requests project context:
+
+```
+conversation.lua calls ai.send(history, context)
+    |
+    v
+codex adapter builds prompt, executes CLI
+    |
+    v
+Parse response -> does it contain tool_requests?
+    |--- NO --> return structured response to conversation
+    |--- YES --> for each request:
+                   execute via editor port (read_file, find_symbol, etc.)
+                   append result to conversation as system context
+                   re-send to AI with updated context
+                   (max 5 iterations to prevent infinite loops)
+```
+
+### Tool request format
+
+The AI is instructed (via system prompt) to request tools using a structured format in its response:
+
+```
+[TOOL_REQUEST]
+action: read_file
+path: src/types.ts
+[/TOOL_REQUEST]
+```
+
+The codex adapter parses these from the raw response text. Everything outside `[TOOL_REQUEST]` blocks is treated as the AI's visible message (shown in chat). Tool requests are:
+- Displayed in the sidebar as system status messages: `-- reading src/types.ts --`
+- Executed via the editor port
+- Results appended to context for the next AI call
+- The AI's next response continues the conversation naturally
+
+Supported tool actions:
+- `read_file { path }` — read a file from the project
+- `find_symbol { name }` — LSP symbol lookup
+- `search_project { pattern }` — ripgrep text search
+
+### Port contract (revised)
 
 **ports/ai.lua**
-Contract:
 ```lua
 {
-  send = function(conversation_history, context) -> response
-  -- response: { type, explanation, changes?, file_requests? }
+  -- Sends a message and handles the tool-use loop internally.
+  -- Calls on_chunk for each piece of visible AI text as it arrives.
+  -- Calls on_status for tool-use status messages.
+  -- Calls on_done with the final structured response.
+  -- Returns a cancel() function.
+  send = function(history, context, callbacks) -> cancel_fn
+  -- callbacks: {
+  --   on_chunk = function(text)        -- partial AI text (for streaming display)
+  --   on_status = function(text)       -- "reading src/types.ts"
+  --   on_done = function(response)     -- { type, explanation, changes? }
+  --   on_error = function(err_msg)     -- error string
+  -- }
 }
 ```
 
-**ports/editor.lua**
-Contract:
-```lua
-{
-  -- Layer 1: Attention (automatic, every message)
-  get_cursor_context = function() -> { file, line, col, filetype, content }
-  get_selection = function() -> { text, range } | nil
-  get_diagnostics = function(line) -> { { message, severity, source } }
-  get_file_content = function(bufnr) -> string
+### Streaming
 
-  -- Layer 2: Project (on demand, AI requests it)
-  read_file = function(path) -> string | nil
-  find_symbol = function(name) -> { { file, line, text } }
-  search_project = function(pattern) -> { { file, line, text } }
-}
-```
+The `codex exec` CLI returns output all at once (not streamed). The initial implementation will:
+1. Show a spinner in the winbar while waiting
+2. Display the full response at once when it arrives via `on_done`
+3. `on_chunk` is called once with the full text (for forward-compatibility)
 
-**ports/presenter.lua**
-Contract:
-```lua
-{
-  open = function()                          -- open sidebar
-  close = function()                         -- close sidebar
-  is_open = function() -> bool
+If a future adapter supports true streaming (e.g., direct API calls), the `on_chunk` callback receives incremental text and the sidebar adapter appends it in real time. The contract supports both patterns without changes.
 
-  append_message = function(role, text)      -- "you", "novim", "system"
-  append_status = function(text)             -- dim system note ("reading file.ts")
-  clear = function()                         -- reset conversation display
+### Cancellation
 
-  show_diff = function(hunks)               -- render inline diff in code buffer
-  clear_diff = function()                   -- remove inline diff preview
-  apply_diff = function()                   -- make diff real (modify buffer)
-  has_pending_diff = function() -> bool
+`send()` returns a `cancel_fn`. Calling it:
+- Kills the underlying `vim.system()` process
+- Fires `on_error("cancelled")`
+- The sidebar shows "Cancelled" and returns to idle state
 
-  set_winbar = function(left, right)        -- update status bar
-  scroll_to_bottom = function()
-}
-```
+Currently, `<Esc>` with a spinner showing (AI thinking) cancels the request. This is handled by the sidebar checking if a request is in flight before deciding what `<Esc>` does.
 
 ## UI Design
 
 ### Sidebar Layout
 
-Right-side vertical split, ~35% of screen width. Single buffer, visually divided:
+Right-side vertical split, ~35% of screen width. Uses **two buffers in one window**, not a single buffer:
+
+1. **Conversation buffer** (read-only) — fills most of the window. Contains all messages. User cannot edit this.
+2. **Input buffer** — a small floating window anchored to the bottom of the sidebar split. Always editable. Always starts with `> ` as a virtual text prefix (using extmarks, not real text — so backspace can't delete it).
+
+The two-buffer approach solves the "partially editable buffer" problem cleanly. The conversation buffer is fully `nomodifiable`. The input buffer is fully editable. They appear as one continuous UI via positioning.
 
 ```
 +-----------------------------+
-| novim                   ASK |  <- winbar: plugin name + current state
+| novim                   ASK |  <- winbar (on sidebar split)
 |- - - - - - - - - - - - - - -|
 |                             |
-| You                         |  <- dim highlight
+| You                         |  <- conversation buffer (read-only)
 | what does this function do  |
 |                             |
-| Novim                       |  <- slightly brighter highlight
+| Novim                       |
 | This function takes a       |
 | callback and registers it   |
 | for the next event loop...  |
 |                             |
-| You                         |
-| why is the import failing   |
+| ~ changes ready             |  <- change indicator
 |                             |
-| Novim                       |
-| The import references       |
-| OrderType from src/types.ts |
-| Let me check that file.     |
-|                             |
-| -- reading src/types.ts --  |  <- system note, muted highlight
-|                             |
-| Novim                       |
-| Found it - OrderType was    |
-| renamed to OrderStatus.     |
-| Here's the fix:             |
-|                             |
-| ~ changes ready (CR apply)  |  <- change indicator
-|                             |
-|- - - - - - - - - - - - - - -|
-| > _                         |  <- input area, always at bottom
++-----------------------------+
+| > _                         |  <- input buffer (floating, editable)
 +-----------------------------+
 ```
 
@@ -161,42 +203,47 @@ Right-side vertical split, ~35% of screen width. Single buffer, visually divided
 **Winbar** — top of sidebar, always visible. Left: `novim`. Right: state indicator.
 - Idle: `ASK`
 - Waiting for AI: spinner animation
-- Diff pending: `DIFF (CR)`
+- Diff pending: `DIFF`
+- AI thinking + diff pending: spinner (request takes priority in display)
 
 **Message roles** — distinct highlight groups:
 - `NovimUser` — your messages, dimmed
 - `NovimAI` — AI messages, normal weight
 - `NovimSystem` — file reads, searches, muted/italic
 
-**Input separator** — virtual text `- - - -` line between conversation and input area.
+**Input buffer** — floating window anchored at sidebar bottom. The `> ` prefix is a virtual text extmark (not real text), so the user can't accidentally delete it. Multi-line input: just keep typing, the float grows up to 5 lines tall, then scrolls. `<CR>` sends.
 
-**Input area** — last line(s) of the buffer. Always starts with `> `. Free-form text input, multi-line supported (shift-enter or just keep typing, it wraps).
-
-**Auto-scroll** — conversation scrolls to latest message. Scrolling up to read freezes auto-scroll. Returning cursor to input area re-enables it.
+**Auto-scroll** — conversation buffer auto-scrolls to bottom when new messages arrive. If the user scrolls up (detected via `WinScrolled` autocmd checking if cursor is above the last line), auto-scroll pauses. It resumes when the user presses any key in the input buffer (detected via `BufEnter` or `InsertEnter` on the input buffer).
 
 ### Inline Diff Preview (in code buffer)
 
-When the AI suggests changes, the code buffer shows a preview:
+When the AI suggests changes, the code buffer shows a preview using extmarks and virtual text. No actual buffer modification until accepted.
 
-- **Removed lines**: red sign in gutter (`-`), dimmed text with strikethrough highlight
-- **Added lines**: green sign in gutter (`+`), shown as virtual lines below the removal point with green highlight
-- **Original code is untouched** — all visual, using extmarks and virtual text
+- **Removed lines**: red sign in gutter (`-`), dimmed text with strikethrough highlight (`NovimDiffRemove`)
+- **Added lines**: green sign in gutter (`+`), shown as virtual lines below the removal point with green highlight (`NovimDiffAdd`). Uses `nvim_buf_set_extmark` with `virt_lines`.
+- **Original code is untouched** underneath the extmarks
 - Preview persists until accepted or dismissed
-- If you keep chatting, the AI can update the preview (old preview is replaced)
+- If the user keeps chatting and the AI suggests an updated change, the old preview extmarks are cleared and replaced with the new ones
+
+**Stale diff protection**: Before applying a diff, `diff.lua` validates that `old_lines` in each hunk still matches the actual buffer content. If the buffer was edited, the diff is rejected with a chat message explaining why.
 
 ### Context Badge
 
-When the sidebar is open, a subtle `>>` marker appears in the code buffer's sign column next to the line the AI is looking at. Moves as you move your cursor. Visual confirmation of "the AI is looking at this."
+When the sidebar is open, a `>>` sign column marker appears next to the line the AI is looking at. Updated via `CursorMoved` autocmd with a 150ms debounce (using `vim.defer_fn`) to avoid flicker. Uses a dedicated extmark namespace so it doesn't conflict with other sign column plugins.
 
 ## Keybinds
 
-| Key | Where | What |
-|-----|-------|------|
-| `<A-x>` | Anywhere | Toggle sidebar open/close |
-| `<CR>` | Sidebar input | Send message if typing; apply diff if pending |
-| `<Esc>` | Sidebar | Dismiss diff if pending; close sidebar if nothing pending |
+| Key | Where | State | What |
+|-----|-------|-------|------|
+| `<A-x>` | Anywhere | Any | Toggle sidebar open/close |
+| `<CR>` | Input buffer | No pending diff | Send message |
+| `<CR>` | Input buffer | Diff pending + input empty | Apply diff |
+| `<CR>` | Input buffer | Diff pending + input has text | Send message (follow-up, diff stays) |
+| `<Esc>` | Input buffer | AI thinking | Cancel request |
+| `<Esc>` | Input buffer | Diff pending | Dismiss diff |
+| `<Esc>` | Input buffer | Idle, no diff | Close sidebar |
 
-Three keys. All contextual. The winbar tells you what `<CR>` and `<Esc>` will do.
+The ambiguity is resolved: **if you're typing something, `<CR>` always sends.** Only when the input is empty AND a diff is pending does `<CR>` apply the diff. `<Esc>` priority: cancel > dismiss diff > close. The winbar reflects the current state so the user always knows what will happen.
 
 ## Interaction Flow
 
@@ -204,13 +251,12 @@ Three keys. All contextual. The winbar tells you what `<CR>` and `<Esc>` will do
 
 ```
 1. Cursor on line 42 of orders.lua, inside processOrder()
-2. Press <A-x> — sidebar opens
+2. Press <A-x> — sidebar opens, input buffer focused
 3. Type: "what does this function do"
-4. Press <CR>
-5. Winbar shows spinner
-6. AI response streams into sidebar with explanation
-7. Winbar returns to ASK
-8. You read, learn, continue coding or ask a follow-up
+4. Press <CR> — message sent, winbar shows spinner
+5. AI response appears in conversation buffer
+6. Winbar returns to ASK
+7. You read, learn, continue coding or ask a follow-up
 ```
 
 ### Fix with diff
@@ -219,22 +265,23 @@ Three keys. All contextual. The winbar tells you what `<CR>` and `<Esc>` will do
 1. Cursor on a line with LSP error "Parameter 'opts' is declared but never used"
 2. Press <A-x> — sidebar opens
 3. Type: "why is this erroring"
-4. AI explains the error in sidebar
+4. Press <CR> — AI explains the error in conversation buffer
 5. Type: "fix it"
-6. AI explains the fix in sidebar + diff preview appears in code buffer
+6. Press <CR> — AI explains the fix + diff preview appears in code buffer
    (opts -> _opts, green/red highlights)
-7. Winbar shows: DIFF (CR)
-8. Press <CR> — diff applied, code modified, preview disappears
+7. Winbar shows: DIFF
+8. Input is empty, press <CR> — diff applied, code modified, preview disappears
 9. Winbar returns to ASK
 ```
 
 ### Cross-file investigation
 
 ```
-1. You: "why is this import failing"
+1. You: "why is this import failing" <CR>
 2. AI: "The import references OrderType from src/types.ts.
         Let me check that file."
-   Chat shows: -- reading src/types.ts --
+   Chat shows: -- reading src/types.ts --  (system status, muted)
+   (codex adapter executes read_file, re-sends to AI)
 3. AI: "Found it - OrderType was renamed to OrderStatus
         in that file. Here's the fix:"
 4. Diff preview appears in code buffer
@@ -248,9 +295,19 @@ Three keys. All contextual. The winbar tells you what `<CR>` and `<Esc>` will do
 2. AI explains
 3. You move cursor to line 80, different function
 4. You: "and what about this one?"
-5. AI sees new cursor position, uses conversation history,
+5. AI sees new cursor position (gathered fresh on send),
+   uses conversation history,
    understands "this one" = the function at line 80
-6. Context badge (>>) moves from line 42 to line 80
+6. Context badge (>>) moves to line 80
+```
+
+### Cancellation
+
+```
+1. You send a message, winbar shows spinner
+2. You realize you asked the wrong thing
+3. Press <Esc> — request cancelled, sidebar shows "Cancelled"
+4. Type a new message and <CR>
 ```
 
 ## Context Awareness
@@ -258,20 +315,84 @@ Three keys. All contextual. The winbar tells you what `<CR>` and `<Esc>` will do
 ### Layer 1 — Attention (automatic, every message)
 
 Gathered by `neovim_editor` adapter on each message send:
-- Current file path and full content (or smart excerpt for very large files)
+- Current file path and filetype
+- File content: files under 500 lines are sent in full. Files over 500 lines send a window of 200 lines above and 200 lines below the cursor, plus the full function/block scope containing the cursor (detected via treesitter or simple brace matching). The truncation boundaries and total line count are noted in the context so the AI knows it's seeing a partial file.
 - Cursor line and column
 - Visual selection text and range (if any)
-- LSP diagnostics on and near the cursor line
-- Filetype
+- LSP diagnostics on and near the cursor line (within 5 lines)
 
 ### Layer 2 — Project (on demand)
 
-Available to the AI when it determines it needs more context:
-- `read_file(path)` — read any file in the project
-- `find_symbol(name)` — LSP-powered symbol lookup
-- `search_project(pattern)` — ripgrep-powered text search
+Available to the AI when it requests tools:
+- `read_file(path)` — read any file in the project. Same 500-line truncation rule applies; if the AI needs a specific section it can request with a line range.
+- `find_symbol(name)` — LSP-powered symbol lookup. Returns up to 20 results: `{ file, line, text }`. Requires an attached LSP client; if none is attached, returns an error message the AI can relay to the user.
+- `search_project(pattern)` — ripgrep text search. Returns up to 30 matches: `{ file, line, text }`. Falls back to `vim.fn.glob` + lua pattern matching if ripgrep is not installed.
 
-The AI decides when to use layer 2. The user sees it happen in chat via system status messages (`-- reading src/types.ts --`).
+The AI decides when to use layer 2. Each tool use is visible in chat.
+
+## Configuration
+
+`require("novim").setup(opts)` with these defaults:
+
+```lua
+{
+  -- AI backend
+  codex_cmd = { "codex", "exec" },  -- command to invoke AI
+  timeout_ms = 90000,               -- max wait per AI call
+  max_tool_rounds = 5,              -- max tool-use loop iterations
+
+  -- Sidebar
+  sidebar_width = 0.35,             -- fraction of screen width
+  sidebar_min_width = 40,           -- minimum columns
+  sidebar_max_width = 80,           -- maximum columns
+  sidebar_position = "right",       -- "right" or "left"
+
+  -- Context
+  context_lines = 200,              -- lines above/below cursor for large files
+  large_file_threshold = 500,       -- lines; above this, truncate context
+
+  -- Diff
+  diff_sign_add = "+",              -- gutter sign for added lines
+  diff_sign_remove = "-",           -- gutter sign for removed lines
+
+  -- Keybind
+  toggle_key = "<A-x>",            -- sidebar toggle; set to false to disable
+}
+```
+
+All options are optional. `setup()` validates: `codex_cmd` must be a table, numeric values must be positive, `sidebar_position` must be "right" or "left". Invalid values log a warning and fall back to defaults.
+
+## Error Handling
+
+Errors are surfaced in the sidebar chat as system messages (muted highlight), not as `vim.notify` popups. The user sees them in context alongside the conversation.
+
+| Scenario | Behavior |
+|----------|----------|
+| `codex` CLI not found | On first `send()`: system message "codex not found — install it and make sure it's in PATH". Sidebar stays open for the user to read. |
+| `codex` CLI exits non-zero | System message with stderr content: "AI request failed: <error>". User can retry by sending another message. |
+| Request timeout | System message: "Request timed out after 90s". Request is cancelled. User can retry. |
+| LSP not attached | `get_diagnostics` returns empty list (no error). `find_symbol` returns error string; the AI relays it: "I can't look up symbols — no language server is running for this file." |
+| ripgrep not installed | `search_project` falls back to lua glob+match. No error shown. |
+| Buffer edited during AI request | Diff validation catches stale hunks. System message: "Code changed since this suggestion — ask again for an updated fix." |
+| AI response has no parseable structure | Entire response treated as explanation (type=explain). No diff attempted. |
+| User closes sidebar with `:q` | `BufWipeout` autocmd on conversation buffer triggers cleanup: cancels any in-flight request, clears diff preview, resets state. Same as pressing `<A-x>` to close. |
+| `:qa` / quit neovim | Sidebar buffer is `buftype=nofile` and `buflisted=false` — does not block quit, does not trigger save prompts. |
+
+## Session Lifecycle
+
+- **Open**: `<A-x>` opens sidebar. Fresh conversation. Context gathered from current cursor position.
+- **Active**: conversation accumulates. Context refreshed on each message send (current cursor, not original).
+- **Close**: `<Esc>` (when idle) or `<A-x>` closes sidebar. Conversation is discarded. Diff preview is cleared.
+- **Reopen**: `<A-x>` again starts a completely fresh session.
+
+This is a deliberate choice: no persistence. The sidebar is ephemeral like a conversation with someone standing next to you. The learning happens in your head and in the code you accept, not in chat history.
+
+## Window Management
+
+- The sidebar is scoped to the current tab. Each tab can have its own sidebar (or not).
+- Opening a sidebar in a tab where one is already open focuses the existing one.
+- Splits, tab switches, and other window operations do not affect the sidebar — it's a normal neovim split with `winfixwidth=true`.
+- The input floating window follows the sidebar split. If the sidebar is resized, the float repositions on `WinResized`.
 
 ## What This Replaces
 
@@ -289,8 +410,8 @@ All of this is replaced by the design above. The v1 code will be removed entirel
 ## Out of Scope
 
 - Persistent chat history across sessions
-- Multi-file diff preview (v2 shows diffs in the currently focused buffer only)
+- Multi-file diff preview (v2 shows diffs in the currently focused buffer only; cross-file changes are explained in chat)
 - Proactive AI suggestions (no ambient/automatic requests)
-- Voice input
-- Image/screenshot support
+- Voice input, image/screenshot support
 - Plugin marketplace or extension system
+- True streaming (initial version receives full response; streaming support is forward-compatible via the callback contract but not implemented in the codex adapter)
