@@ -144,6 +144,12 @@ function M:send(history, context, callbacks)
         if cancelled then return end
 
         if result.code ~= 0 then
+          -- Detect timeout: vim.system sends SIGTERM (signal 15) on timeout
+          if result.signal == 15 or (result.stderr and result.stderr:find("timed? ?out")) then
+            local timeout_s = math.floor((self.config.timeout_ms or 90000) / 1000)
+            callbacks.on_error("Request timed out after " .. timeout_s .. "s")
+            return
+          end
           local err = result.stderr or result.stdout or "unknown error"
           if err == "" then err = "codex exited with code " .. result.code end
           callbacks.on_error("AI request failed: " .. vim.trim(err))

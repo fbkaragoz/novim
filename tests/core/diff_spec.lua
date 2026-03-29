@@ -155,8 +155,8 @@ describe("diff", function()
       assert.equals(0.0, diff._line_similarity("", "hello"))
     end)
 
-    it("returns 0.5 for two empty lines", function()
-      assert.equals(0.5, diff._line_similarity("", ""))
+    it("returns 1.0 for two empty lines (identical)", function()
+      assert.equals(1.0, diff._line_similarity("", ""))
     end)
 
     it("returns partial score for partially matching lines", function()

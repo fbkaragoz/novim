@@ -79,12 +79,6 @@ function M.toggle()
 end
 
 function M._open()
-  local cmd = state.config.codex_cmd[1]
-  if vim.fn.executable(cmd) ~= 1 then
-    M._show_error(cmd .. " not found — install it and make sure it's in PATH")
-    return
-  end
-
   state.conversation = conversation_mod.new()
   state.pending_diff = nil
   state.cancel_fn = nil
@@ -127,6 +121,13 @@ end
 
 function M._on_submit(text)
   if not state.conversation or not state.sidebar then return end
+
+  -- Check codex availability on first send (sidebar stays open for user to read error)
+  local cmd = state.config.codex_cmd[1]
+  if vim.fn.executable(cmd) ~= 1 then
+    state.sidebar:add_message("system", cmd .. " not found — install it and make sure it's in PATH")
+    return
+  end
 
   local context = state.editor:get_context()
   state.conversation:add("user", text, context)

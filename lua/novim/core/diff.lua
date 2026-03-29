@@ -129,11 +129,11 @@ function M._fuzzy_match(new_lines, buffer_lines)
 end
 
 function M._line_similarity(a, b)
+  if a == b then return 1.0 end
   local at = a:match("^%s*(.-)%s*$") or ""
   local bt = b:match("^%s*(.-)%s*$") or ""
-  if #at == 0 and #bt == 0 then return 0.5 end
-  if a == b then return 1.0 end
   if at == bt then return 0.9 end
+  if #at == 0 and #bt == 0 then return 0.5 end
   if #at == 0 or #bt == 0 then return 0.0 end
   local shorter = #at < #bt and at or bt
   local longer = #at < #bt and bt or at
