@@ -68,5 +68,32 @@ describe("intent", function()
     it("prioritizes diagnose over explain for error-like questions", function()
       assert.equals("diagnose", intent.classify("what is wrong here"))
     end)
+
+    it("handles nil input gracefully", function()
+      assert.equals("explain", intent.classify(nil))
+    end)
+
+    it("prioritizes fix over write when both match", function()
+      assert.equals("fix", intent.classify("fix and add a test"))
+    end)
+
+    it("prioritizes write over diagnose for creation with error words", function()
+      assert.equals("write", intent.classify("add error handling"))
+      assert.equals("write", intent.classify("create a bug tracker"))
+    end)
+
+    it("handles multi-line input", function()
+      assert.equals("fix", intent.classify("can you please\nfix this function"))
+    end)
+
+    it("handles input with only whitespace", function()
+      assert.equals("explain", intent.classify("   "))
+    end)
+
+    it("matches patterns at different positions in text", function()
+      assert.equals("explain", intent.classify("I don't understand what this does"))
+      assert.equals("fix", intent.classify("please fix the login handler"))
+      assert.equals("refactor", intent.classify("can you refactor the database module"))
+    end)
   end)
 end)

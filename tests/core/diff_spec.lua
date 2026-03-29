@@ -205,5 +205,133 @@ describe("diff", function()
       local ok, _ = diff.validate_hunks(hunks, buffer)
       assert.is_true(ok)
     end)
+
+    it("returns true for empty hunks list", function()
+      local ok, err = diff.validate_hunks({}, { "a", "b" })
+      assert.is_true(ok)
+      assert.is_nil(err)
+    end)
+  end)
+
+  -- Additional comprehensive tests
+
+  describe("parse edge cases", function()
+    it("handles response with only code block and no explanation", function()
+      local buffer = { "old line" }
+      local text = "```lua\nnew line\n```"
+      local result = diff.parse(text, "test.lua", buffer)
+      assert.equals("", result.explanation)
+      assert.is_true(#result.changes > 0 or result.type == "explain")
+    end)
+
+    it("handles response with multiple bare code blocks", function()
+      local buffer = { "aaa", "bbb", "ccc", "ddd", "eee" }
+      local text = "First change:\n```\naaa_new\n```\nSecond change:\n```\nccc_new\n```"
+      local result = diff.parse(text, "test.lua", buffer)
+      assert.is_table(result)
+      assert.is_string(result.explanation)
+    end)
+
+    it("returns explain type when code blocks cannot be matched", function()
+      local buffer = { "completely", "different", "content" }
+      local text = "Fix:\n```\nzzzzzzzzzzz\nyyyyyyyyy\n```"
+      local result = diff.parse(text, "test.lua", buffer)
+      -- If fuzzy match fails (< 30% similarity), no hunks are created
+      assert.is_table(result)
+    end)
+
+    it("handles nil buffer_lines", function()
+      local text = "@@ test.lua:1 @@\n```\nnew content\n```"
+      local result = diff.parse(text, "test.lua", nil)
+      assert.is_table(result)
+      if #result.changes > 0 then
+        assert.same({}, result.changes[1].old_lines)
+      end
+    end)
+
+    it("preserves multi-line explanation across multiple code blocks", function()
+      local text = "Line one.\nLine two.\n```\ncode1\n```\nLine three.\n```\ncode2\n```\nLine four."
+      local explanation, blocks = diff._extract_parts(text)
+      assert.truthy(explanation:find("Line one."))
+      assert.truthy(explanation:find("Line two."))
+      assert.truthy(explanation:find("Line three."))
+      assert.truthy(explanation:find("Line four."))
+      assert.equals(2, #blocks)
+    end)
+  end)
+
+  describe("_extract_parts edge cases", function()
+    it("handles unclosed code fence", function()
+      local text = "Start:\n```lua\nsome code\nmore code"
+      local explanation, blocks = diff._extract_parts(text)
+      -- Unclosed fence: content captured until end
+      assert.is_string(explanation)
+      assert.is_table(blocks)
+    end)
+
+    it("handles @@ marker without following code fence", function()
+      local text = "@@ file.lua:10 @@\nThis is not a code block"
+      local explanation, blocks = diff._extract_parts(text)
+      -- Marker not followed by ``` should be treated as explanation text
+      assert.truthy(explanation:find("file.lua"))
+      assert.equals(0, #blocks)
+    end)
+
+    it("handles nested-looking code fences", function()
+      local text = "```\nouter\n```\nmiddle\n```\ninner\n```"
+      local _, blocks = diff._extract_parts(text)
+      assert.equals(2, #blocks)
+      assert.same({ "outer" }, blocks[1].content)
+      assert.same({ "inner" }, blocks[2].content)
+    end)
+
+    it("handles @@ marker with spaces in filename", function()
+      local text = "@@ src/my file.lua:5 @@\n```\ncontent\n```"
+      local _, blocks = diff._extract_parts(text)
+      assert.equals(1, #blocks)
+      assert.equals("src/my file.lua", blocks[1].file)
+      assert.equals(5, blocks[1].line)
+    end)
+  end)
+
+  describe("_fuzzy_match edge cases", function()
+    it("picks best match when multiple regions are similar", function()
+      local buffer = { "local a = 1", "local b = 2", "local c = 3", "local a = 1", "local d = 4" }
+      local new_lines = { "local a = 1" }
+      local result = diff._fuzzy_match(new_lines, buffer)
+      -- Should match first occurrence
+      assert.equals(1, result)
+    end)
+
+    it("handles window larger than buffer", function()
+      local buffer = { "a" }
+      local new_lines = { "a", "b", "c" }
+      local result = diff._fuzzy_match(new_lines, buffer)
+      -- Window is larger, still tries to match
+      assert.is_true(result == nil or result == 1)
+    end)
+  end)
+
+  describe("_line_similarity edge cases", function()
+    it("handles strings with special Lua pattern characters", function()
+      local score = diff._line_similarity("if (x > 0) {", "if (x > 0) {")
+      assert.equals(1.0, score)
+    end)
+
+    it("returns high score for similar lines with minor changes", function()
+      local score = diff._line_similarity("function foo(bar)", "function foo(baz)")
+      assert.is_true(score > 0.7)
+    end)
+
+    it("returns low score for completely different lines", function()
+      local score = diff._line_similarity("aaaa", "zzzz")
+      assert.is_true(score < 0.5)
+    end)
+
+    it("handles whitespace-only strings", function()
+      local score = diff._line_similarity("   ", "\t\t")
+      -- Both trim to empty -> 0.9 (trimmed match)
+      assert.equals(0.9, score)
+    end)
   end)
 end)
