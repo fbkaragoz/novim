@@ -1,0 +1,6 @@
+describe("intent", function()
+  it("module loads", function()
+    local intent = require("novim.core.intent")
+    assert.is_table(intent)
+  end)
+end)
